@@ -1,9 +1,12 @@
 mod config;
+mod database;
 mod error;
 mod handlers;
 mod info;
 mod mcp;
+mod responses;
 mod server;
+mod types;
 mod utils;
 
 use std::{
@@ -17,7 +20,7 @@ use std::{
 use axum::{
     body::Body,
     http::{self, HeaderValue, Request},
-    routing::{Router, get, post},
+    routing::{Router, get, post, delete},
 };
 use clap::Parser;
 use config::Config;
@@ -35,6 +38,7 @@ use tracing::Level;
 use uuid::Uuid;
 
 use crate::{
+    database::DatabaseManager,
     info::ServerInfo,
     server::{Server, ServerGroup, ServerId, ServerKind},
 };
@@ -118,7 +122,8 @@ async fn main() -> ServerResult<()> {
         config.server.port,
     ));
 
-    let state = Arc::new(AppState::new(config, ServerInfo::default()));
+    let database_path = "responses.db";
+    let state = Arc::new(AppState::new(config, ServerInfo::default(), database_path).await?);
 
     // Start the health check task if enabled
     if cli.check_health {
@@ -128,7 +133,7 @@ async fn main() -> ServerResult<()> {
 
     // Set up CORS
     let cors = CorsLayer::new()
-        .allow_methods([http::Method::GET, http::Method::POST])
+        .allow_methods([http::Method::GET, http::Method::POST, http::Method::DELETE])
         .allow_headers(Any)
         .allow_origin(Any);
 
@@ -150,6 +155,13 @@ async fn main() -> ServerResult<()> {
             .route("/v1/images/edits", post(handlers::image_handler))
             .route("/v1/models", get(handlers::models_handler))
             .route("/v1/info", get(handlers::info_handler))
+            // Responses API endpoints
+            .route("/v1/responses", post(handlers::responses::create_response_handler))
+            .route("/v1/responses/{response_id}", get(handlers::responses::get_response_handler))
+            .route("/v1/responses/{response_id}", delete(handlers::responses::delete_response_handler))
+            .route("/v1/responses/{response_id}/cancel", post(handlers::responses::cancel_response_handler))
+            .route("/v1/responses/{response_id}/input_items", get(handlers::responses::list_input_items_handler))
+            // Admin endpoints
             .route(
                 "/admin/servers/register",
                 post(handlers::admin::register_downstream_server_handler),
@@ -367,15 +379,20 @@ pub(crate) struct AppState {
     config: Arc<RwLock<Config>>,
     server_info: Arc<RwLock<ServerInfo>>,
     models: Arc<RwLock<HashMap<ServerId, Vec<endpoints::models::Model>>>>,
+    database: Arc<DatabaseManager>,
 }
 impl AppState {
-    pub(crate) fn new(config: Config, server_info: ServerInfo) -> Self {
-        Self {
+    pub(crate) async fn new(config: Config, server_info: ServerInfo, database_path: &str) -> ServerResult<Self> {
+        let database = DatabaseManager::new(database_path).await
+            .map_err(|e| ServerError::Operation(format!("Failed to initialize database: {}", e)))?;
+
+        Ok(Self {
             server_group: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),
             server_info: Arc::new(RwLock::new(server_info)),
             models: Arc::new(RwLock::new(HashMap::new())),
-        }
+            database: Arc::new(database),
+        })
     }
 
     pub(crate) async fn register_downstream_server(&self, server: Server) -> ServerResult<()> {

@@ -28,6 +28,7 @@ use crate::{
     info::ApiServer,
     mcp::{DEFAULT_SEARCH_FALLBACK_MESSAGE, MCP_SERVICES, MCP_TOOLS, SEARCH_MCP_SERVER_NAMES},
     server::{RoutingPolicy, Server, ServerIdToRemove, ServerKind, TargetServerInfo},
+    types::Role,
 };
 
 pub(crate) async fn chat_handler(
@@ -2417,5 +2418,519 @@ async fn call_mcp_server(
         let err_msg = "Empty MCP TOOLS";
         dual_error!("{} - request_id: {}", err_msg, request_id);
         Err(ServerError::Operation(err_msg.to_string()))
+    }
+}
+
+pub(crate) mod responses {
+    use super::*;
+    use crate::{
+        responses::{ResponseRequest, ResponseObject, DeleteResponseResult, InputItemList},
+    };
+    use axum::extract::Path;
+    use chrono::Utc;
+
+    pub(crate) async fn create_response_handler(
+        State(state): State<Arc<AppState>>,
+        Extension(cancel_token): Extension<CancellationToken>,
+        headers: HeaderMap,
+        Json(request): Json<ResponseRequest>,
+    ) -> ServerResult<axum::response::Response> {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
+        dual_info!(
+            "Received a new response request for model: {} - request_id: {}",
+            request.model,
+            request_id
+        );
+
+        let response_id = ResponseRequest::generate_id();
+        let _created_at = Utc::now().timestamp();
+
+        // Get conversation history if previous_response_id is provided
+        let conversation_history = if let Some(prev_id) = &request.previous_response_id {
+            match build_conversation_history(&state.database, prev_id.clone(), &request_id).await {
+                Ok(history) => history,
+                Err(e) => {
+                    dual_warn!("Failed to build conversation history for {}: {} - request_id: {}", prev_id, e, request_id);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Convert ResponseRequest to ChatCompletionRequest
+        let chat_request = request.to_chat_completion_request(conversation_history);
+
+        // Get target chat server
+        let chat_server = get_chat_server(&state, &request_id).await?;
+
+        // Send request to downstream server
+        let mut mutable_chat_request = chat_request;
+        let response = send_request_with_retry(
+            &chat_server,
+            &mut mutable_chat_request,
+            &headers,
+            &request_id,
+            cancel_token.clone(),
+        )
+        .await?;
+
+        // Handle the response based on stream mode
+        let response_obj = match request.stream.unwrap_or(false) {
+            true => {
+                // For streaming responses, we need different handling
+                // For now, return an error as streaming needs special implementation
+                return Err(ServerError::Operation("Streaming responses not yet implemented".to_string()));
+            }
+            false => {
+                // Handle non-stream response
+                let bytes = read_response_bytes(response, &request_id, cancel_token).await?;
+                let chat_completion = parse_chat_completion(&bytes, &request_id)?;
+                
+                // Convert to ResponseObject
+                let mut response_obj = ResponseObject::from(chat_completion);
+                response_obj.id = response_id.clone();
+                response_obj.previous_response_id = request.previous_response_id.clone();
+                response_obj.instructions = request.instructions.clone();
+                response_obj.temperature = request.temperature;
+                response_obj.top_p = request.top_p;
+                response_obj.store = request.store;
+                response_obj.metadata = request.metadata.clone();
+                response_obj.user = request.user.clone();
+                response_obj.safety_identifier = request.safety_identifier.clone();
+                response_obj.prompt_cache_key = request.prompt_cache_key.clone();
+                response_obj.truncation = request.truncation.clone();
+                response_obj.verbosity = request.verbosity.clone();
+
+                response_obj
+            }
+        };
+
+        // Store response in database
+        let db_response = crate::database::ResponseSession {
+            id: response_obj.id.clone(),
+            object: response_obj.object.clone(),
+            created_at: response_obj.created_at,
+            status: response_obj.status.clone(),
+            model: response_obj.model.clone(),
+            previous_response_id: response_obj.previous_response_id.clone(),
+            instructions: response_obj.instructions.clone(),
+            max_output_tokens: response_obj.max_output_tokens,
+            temperature: response_obj.temperature,
+            top_p: response_obj.top_p,
+            store: response_obj.store.unwrap_or(true),
+            metadata: response_obj.metadata.clone(),
+            user_id: response_obj.user.clone(),
+            safety_identifier: response_obj.safety_identifier.clone(),
+            prompt_cache_key: response_obj.prompt_cache_key.clone(),
+            usage_input_tokens: response_obj.usage.as_ref().map(|u| u.input_tokens),
+            usage_output_tokens: response_obj.usage.as_ref().map(|u| u.output_tokens),
+            usage_total_tokens: response_obj.usage.as_ref().map(|u| u.total_tokens),
+            error: response_obj.error.as_ref().map(|e| serde_json::to_string(e).unwrap_or_default()),
+            incomplete_details: response_obj.incomplete_details.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+        };
+
+        if let Err(e) = state.database.store_response(db_response).await {
+            dual_warn!("Failed to store response in database: {} - request_id: {}", e, request_id);
+        } else {
+            // Store input items
+            if let Some(input) = &request.input {
+                let input_content = serde_json::to_string(input).unwrap_or_default();
+                let input_item = crate::database::InputItem {
+                    id: ResponseRequest::generate_message_id(),
+                    response_id: response_obj.id.clone(),
+                    item_type: "message".to_string(),
+                    role: Some(Role::User),
+                    content: input_content,
+                    created_at: response_obj.created_at,
+                };
+                
+                if let Err(e) = state.database.store_input_item(input_item).await {
+                    dual_warn!("Failed to store input item in database: {} - request_id: {}", e, request_id);
+                }
+            }
+            
+            // Store output items
+            for output_item in &response_obj.output {
+                let output_content = serde_json::to_string(output_item).unwrap_or_default();
+                let db_output_item = crate::database::OutputItem {
+                    id: output_item.id.clone(),
+                    response_id: response_obj.id.clone(),
+                    item_type: output_item.item_type.clone(),
+                    role: output_item.role.clone(),
+                    content: output_content,
+                    status: output_item.status.clone(),
+                    created_at: response_obj.created_at,
+                };
+                
+                if let Err(e) = state.database.store_output_item(db_output_item).await {
+                    dual_warn!("Failed to store output item in database: {} - request_id: {}", e, request_id);
+                }
+            }
+        }
+
+        let json_body = serde_json::to_string(&response_obj).map_err(|e| {
+            let err_msg = format!("Failed to serialize response: {}", e);
+            dual_error!("{} - request_id: {}", err_msg, request_id);
+            ServerError::Operation(err_msg)
+        })?;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(json_body))
+            .map_err(|e| {
+                let err_msg = format!("Failed to create response: {}", e);
+                dual_error!("{} - request_id: {}", err_msg, request_id);
+                ServerError::Operation(err_msg)
+            })
+    }
+
+    pub(crate) async fn get_response_handler(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        Path(response_id): Path<String>,
+    ) -> ServerResult<axum::response::Response> {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
+        dual_info!(
+            "Getting response: {} - request_id: {}",
+            response_id,
+            request_id
+        );
+
+        match state.database.get_response(&response_id).await {
+            Ok(Some(db_response)) => {
+                // Convert database response to API response format
+                let response_obj = ResponseObject {
+                    id: db_response.id,
+                    object: db_response.object,
+                    created_at: db_response.created_at,
+                    model: db_response.model,
+                    status: db_response.status,
+                    previous_response_id: db_response.previous_response_id,
+                    instructions: db_response.instructions,
+                    max_output_tokens: db_response.max_output_tokens,
+                    temperature: db_response.temperature,
+                    top_p: db_response.top_p,
+                    store: Some(db_response.store),
+                    metadata: db_response.metadata,
+                    user: db_response.user_id,
+                    safety_identifier: db_response.safety_identifier,
+                    prompt_cache_key: db_response.prompt_cache_key,
+                    tools: None, // TODO: Implement tool retrieval
+                    tool_choice: None, // TODO: Implement tool choice retrieval
+                    parallel_tool_calls: None,
+                    output: Vec::new(), // TODO: Get from output_items table
+                    error: db_response.error.and_then(|e| serde_json::from_str(&e).ok()),
+                    incomplete_details: db_response.incomplete_details.and_then(|d| serde_json::from_str(&d).ok()),
+                    usage: if let (Some(input), Some(output), Some(total)) = 
+                        (db_response.usage_input_tokens, db_response.usage_output_tokens, db_response.usage_total_tokens) {
+                        Some(crate::responses::Usage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            total_tokens: total,
+                            input_tokens_details: None,
+                            output_tokens_details: None,
+                        })
+                    } else {
+                        None
+                    },
+                    reasoning: None,
+                    truncation: None,
+                    verbosity: None,
+                };
+
+                let json_body = serde_json::to_string(&response_obj).map_err(|e| {
+                    let err_msg = format!("Failed to serialize response: {}", e);
+                    dual_error!("{} - request_id: {}", err_msg, request_id);
+                    ServerError::Operation(err_msg)
+                })?;
+
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json_body))
+                    .map_err(|e| {
+                        let err_msg = format!("Failed to create response: {}", e);
+                        dual_error!("{} - request_id: {}", err_msg, request_id);
+                        ServerError::Operation(err_msg)
+                    })
+            }
+            Ok(None) => {
+                Err(ServerError::Operation("Response not found".to_string()))
+            }
+            Err(e) => {
+                let err_msg = format!("Database error: {}", e);
+                dual_error!("{} - request_id: {}", err_msg, request_id);
+                Err(ServerError::Operation(err_msg))
+            }
+        }
+    }
+
+    pub(crate) async fn delete_response_handler(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        Path(response_id): Path<String>,
+    ) -> ServerResult<axum::response::Response> {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
+        dual_info!(
+            "Deleting response: {} - request_id: {}",
+            response_id,
+            request_id
+        );
+
+        match state.database.delete_response(&response_id).await {
+            Ok(deleted) => {
+                if deleted {
+                    let result = DeleteResponseResult {
+                        id: response_id,
+                        object: "response".to_string(),
+                        deleted: true,
+                    };
+
+                    let json_body = serde_json::to_string(&result).map_err(|e| {
+                        let err_msg = format!("Failed to serialize delete result: {}", e);
+                        dual_error!("{} - request_id: {}", err_msg, request_id);
+                        ServerError::Operation(err_msg)
+                    })?;
+
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(json_body))
+                        .map_err(|e| {
+                            let err_msg = format!("Failed to create response: {}", e);
+                            dual_error!("{} - request_id: {}", err_msg, request_id);
+                            ServerError::Operation(err_msg)
+                        })
+                } else {
+                    Err(ServerError::Operation("Response not found".to_string()))
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("Database error: {}", e);
+                dual_error!("{} - request_id: {}", err_msg, request_id);
+                Err(ServerError::Operation(err_msg))
+            }
+        }
+    }
+
+    pub(crate) async fn cancel_response_handler(
+        State(_state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        Path(response_id): Path<String>,
+    ) -> ServerResult<axum::response::Response> {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
+        dual_info!(
+            "Cancelling response: {} - request_id: {}",
+            response_id,
+            request_id
+        );
+
+        // TODO: Implement response cancellation
+        // For now, return not found
+        Err(ServerError::Operation("Response cancellation not yet implemented".to_string()))
+    }
+
+    pub(crate) async fn list_input_items_handler(
+        State(_state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        Path(response_id): Path<String>,
+    ) -> ServerResult<axum::response::Response> {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
+        dual_info!(
+            "Listing input items for response: {} - request_id: {}",
+            response_id,
+            request_id
+        );
+
+        // TODO: Implement input items listing from database
+        // For now, return empty list
+        let result = InputItemList {
+            object: "list".to_string(),
+            data: Vec::new(),
+            first_id: "".to_string(),
+            last_id: "".to_string(),
+            has_more: false,
+        };
+
+        let json_body = serde_json::to_string(&result).map_err(|e| {
+            let err_msg = format!("Failed to serialize input items: {}", e);
+            dual_error!("{} - request_id: {}", err_msg, request_id);
+            ServerError::Operation(err_msg)
+        })?;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(json_body))
+            .map_err(|e| {
+                let err_msg = format!("Failed to create response: {}", e);
+                dual_error!("{} - request_id: {}", err_msg, request_id);
+                ServerError::Operation(err_msg)
+            })
+    }
+
+    async fn build_conversation_history(
+        database: &Arc<crate::database::DatabaseManager>,
+        previous_response_id: String,
+        request_id: &str,
+    ) -> Result<Vec<endpoints::chat::ChatCompletionRequestMessage>, crate::error::ServerError> {
+        let mut messages = Vec::new();
+
+        // Get the conversation history from database
+        let response_sessions = match database.get_conversation_history(&previous_response_id).await {
+            Ok(history) => {
+                dual_debug!("Retrieved {} response sessions from conversation history - request_id: {}", history.len(), request_id);
+                history
+            }
+            Err(e) => {
+                return Err(crate::error::ServerError::Operation(format!("Failed to get conversation history: {}", e)));
+            }
+        };
+
+        // For each response in history, get its input and output items
+        for response in response_sessions {
+            // Add system message from instructions if present
+            if let Some(instructions) = &response.instructions {
+                messages.push(endpoints::chat::ChatCompletionRequestMessage::System(
+                    endpoints::chat::ChatCompletionSystemMessage::new(instructions.clone(), None)
+                ));
+            }
+
+            // Get and add input items (user messages)
+            match database.get_input_items(&response.id).await {
+                Ok(input_items) => {
+                    for input_item in input_items {
+                        // Parse the stored JSON content back to InputTypes
+                        if let Ok(input_content) = serde_json::from_str::<crate::responses::InputTypes>(&input_item.content) {
+                            match input_content {
+                                crate::responses::InputTypes::Text(text) => {
+                                    let role = input_item.role.as_ref().unwrap_or(&Role::User);
+                                    match role {
+                                        Role::User => {
+                                            messages.push(endpoints::chat::ChatCompletionRequestMessage::User(
+                                                endpoints::chat::ChatCompletionUserMessage::new(
+                                                    endpoints::chat::ChatCompletionUserMessageContent::Text(text),
+                                                    None
+                                                )
+                                            ));
+                                        }
+                                        Role::System => {
+                                            messages.push(endpoints::chat::ChatCompletionRequestMessage::System(
+                                                endpoints::chat::ChatCompletionSystemMessage::new(text, None)
+                                            ));
+                                        }
+                                        _ => {
+                                            // Default to user message
+                                            messages.push(endpoints::chat::ChatCompletionRequestMessage::User(
+                                                endpoints::chat::ChatCompletionUserMessage::new(
+                                                    endpoints::chat::ChatCompletionUserMessageContent::Text(text),
+                                                    None
+                                                )
+                                            ));
+                                        }
+                                    }
+                                }
+                                crate::responses::InputTypes::Array(items) => {
+                                    for item in items {
+                                        match &item.content {
+                                            crate::responses::InputContent::Text { text } => {
+                                                let role = item.role.as_ref().unwrap_or(&Role::User);
+                                                match role {
+                                                    Role::User => {
+                                                        messages.push(endpoints::chat::ChatCompletionRequestMessage::User(
+                                                            endpoints::chat::ChatCompletionUserMessage::new(
+                                                                endpoints::chat::ChatCompletionUserMessageContent::Text(text.clone()),
+                                                                None
+                                                            )
+                                                        ));
+                                                    }
+                                                    Role::System => {
+                                                        messages.push(endpoints::chat::ChatCompletionRequestMessage::System(
+                                                            endpoints::chat::ChatCompletionSystemMessage::new(text.clone(), None)
+                                                        ));
+                                                    }
+                                                    _ => {
+                                                        messages.push(endpoints::chat::ChatCompletionRequestMessage::User(
+                                                            endpoints::chat::ChatCompletionUserMessage::new(
+                                                                endpoints::chat::ChatCompletionUserMessageContent::Text(text.clone()),
+                                                                None
+                                                            )
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                // Skip non-text inputs for now
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    dual_warn!("Failed to get input items for response {}: {} - request_id: {}", response.id, e, request_id);
+                }
+            }
+
+            // Get and add output items (assistant messages)
+            match database.get_output_items(&response.id).await {
+                Ok(output_items) => {
+                    for output_item in output_items {
+                        // Parse the stored JSON content back to OutputItem
+                        if let Ok(parsed_output) = serde_json::from_str::<crate::responses::OutputItem>(&output_item.content) {
+                            if let Some(content) = parsed_output.content {
+                                for content_item in content {
+                                    match content_item.content_data {
+                                        crate::responses::OutputContentData::Text { text, .. } => {
+                                            messages.push(endpoints::chat::ChatCompletionRequestMessage::Assistant(
+                                                endpoints::chat::ChatCompletionAssistantMessage::new(Some(text), None, None)
+                                            ));
+                                        }
+                                        _ => {
+                                            // Skip non-text outputs for now
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    dual_warn!("Failed to get output items for response {}: {} - request_id: {}", response.id, e, request_id);
+                }
+            }
+        }
+
+        dual_debug!("Built conversation history with {} messages - request_id: {}", messages.len(), request_id);
+        Ok(messages)
     }
 }
